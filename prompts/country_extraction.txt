@@ -1,0 +1,11 @@
+Extract all country names mentioned in the following text. Return a JSON object with a single key "countries" containing a list of standardised English country names.
+
+Rules:
+- Include only sovereign countries, not world regions, continents, or sub-national areas (provinces, states, districts are fine to detect but convert to their country: "Odisha" -> "India")
+- Normalise to the standard English name used in international contexts (e.g. "Ivory Coast" -> "Cote d'Ivoire", "DRC" -> "Democratic Republic of the Congo", "Burma" -> "Myanmar")
+- Include countries mentioned as study locations, even if referred to adjectivally (e.g. "Kenyan farmers" -> "Kenya")
+- Exclude countries mentioned only in author affiliations or funding sources if these are clearly separate from the study location
+- If no countries can be identified, return {"countries": []}
+- Return ONLY the JSON object, no other text, no markdown formatting
+
+Text: {text}

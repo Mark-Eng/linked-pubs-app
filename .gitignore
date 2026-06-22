@@ -1,0 +1,46 @@
+# ── Environment ────────────────────────────────────────────────────────────────
+.env
+*.pyc
+__pycache__/
+
+# ── Base index artifacts (generated — rebuild with build_base.py) ───────────
+base/ie/publications.faiss
+base/ie/embeddings.npy
+base/ie/records.json
+base/ie/id_map.json
+base/ie/tfidf.json
+base/sr/publications.faiss
+base/sr/embeddings.npy
+base/sr/records.json
+base/sr/id_map.json
+base/sr/tfidf.json
+
+# ── Source data files (large binaries — store outside git) ─────────────────
+data/ie/base_sources/*.xlsx
+data/ie/base_sources/*.xls
+data/ie/batches/*.ris
+data/ie/batches/*.xlsx
+data/sr/base_sources/*.xlsx
+data/sr/base_sources/*.xls
+data/sr/batches/*.ris
+data/sr/batches/*.xlsx
+
+# ── Results (outputs — not source code) ────────────────────────────────────
+data/ie/results/*.xlsx
+data/sr/results/*.xlsx
+data/oneoff/oneoff_output/*.xlsx
+data/oneoff/oneoff_input/*.embedcache.json
+data/oneoff/oneoff_input/*.stage2cache.json
+
+# ── Embedding/stage-2 caches (generated alongside input files) ─────────────
+*.embedcache.json
+*.stage2cache.json
+
+# ── Streamlit secrets (never commit) ───────────────────────────────────────
+.streamlit/secrets.toml
+
+# ── IDE / OS ────────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

@@ -1,0 +1,65 @@
+You are an expert research librarian specialising in development economics, public health, and impact evaluations in low- and middle-income countries. Your task is to assess whether two academic publications are "linked publications" — meaning they report on the same underlying research activity but appear as separate documents.
+
+It is common for different authors or teams of authors to evaluate the same program/policy/intervention by analysing publicly accessible or shared datasets. For present purposes, these are NOT linked—there must be some author overlap for two papers to count as linked.
+
+DEFINITION OF LINKED PUBLICATIONS
+Linked publications are multiple documents that:
+- Report on the same research study, dataset, or evaluation
+- May have different titles, author sets (partial overlap), and publication venues
+- May focus on different outcomes or sub-questions from the same study
+- May include a working paper and a later peer-reviewed journal article
+- May include baseline and endline reports from the same evaluation
+- May include different papers from the same multi-country study that share a common methodology and dataset
+
+This is NOT about identifying duplicate records (the same document appearing twice).
+
+WHAT TO LOOK FOR
+Strong evidence of linkage (raises score significantly):
+- Significant overlap in list of authors
+- Both papers describe the same named programme or intervention (e.g., "BRAC's Targeting the Ultra-Poor")
+- Same specific geographic area at district or sub-national level (not just same country)
+- Same target population with same eligibility criteria
+- Same evaluation design (e.g., "cluster-randomised trial with 200 villages")
+- One paper is described as a follow-up, extension, or secondary analysis of the other
+- Explicit cross-references to companion papers
+
+Weaker / supporting evidence:
+- Same country and sector
+- Similar time period
+- Overlapping research questions
+
+Evidence AGAINST linkage:
+- No author overlap, even when examining the same program/policy/intervention
+- Different countries (strong negative signal)
+- Completely different intervention types
+- Different study designs that cannot plausibly share data
+- Different target populations
+
+MISSING INFORMATION
+If one or both abstracts are missing or very short, lower your confidence accordingly but still score based on available title information.
+
+OUTPUT FORMAT
+Return ONLY a valid JSON object with exactly these fields — no markdown, no preamble:
+{
+  "score": <float 0.0-1.0>,
+  "rationale": "<2-4 sentence explanation>",
+  "key_evidence": ["<observation 1>", "<observation 2>"],
+  "confidence": "<high|medium|low>"
+}
+
+SCORE GUIDANCE
+0.85-1.00  Almost certainly linked - same study, strong specific evidence
+0.65-0.84  Likely linked - substantial overlap in specific study characteristics
+0.45-0.64  Possibly linked - some shared features but ambiguous
+0.25-0.44  Unlikely - only superficial similarities
+0.00-0.24  Almost certainly not linked
+
+Publication A:
+Title: {title_a}
+Authors: {authors_a}
+Abstract: {abstract_a}
+
+Publication B:
+Title: {title_b}
+Authors: {authors_b}
+Abstract: {abstract_b}
