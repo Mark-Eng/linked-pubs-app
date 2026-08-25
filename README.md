@@ -8,7 +8,7 @@ This tool scans a set of research publications and flags pairs that are likely r
 
 The tool is tailored for use in maintaining a living evidence repository in international development, but many parts of the tool can be adapted for more general use.
 
-It is designed for two parallel datasets — **IEs** (impact evaluations) and **SRs** (systematic reviews) — and supports three main workflows:
+It is designed for two parallel datasets — **IEs** (impact evaluations) and **SRs** (systematic reviews) — and supports two main workflows:
 
 - **Within-dataset audit**: check all records in an existing dataset against each other
 - **Batch comparison**: check a new incoming batch against an approved base database
