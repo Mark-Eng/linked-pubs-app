@@ -59,8 +59,6 @@ Composite score + ranked Excel output
 
 **Stage 3 (optional)** sends pairs within a user-specified range of base composite scores to a large language model, which reads the titles and abstracts and gives an independent score with a rationale. The LLM result is incorporated into the final composite.
 
-**Country signal** 
-
 **Composite score formula** (weights configurable in `.env`):
 ```
 composite = clip(raw + country_modifier, 0, 1)
