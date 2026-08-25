@@ -1,6 +1,6 @@
 # Linked Publications Detection Tool
 
-(Link to the online app)[https://find-linked-pubs.streamlit.app/]
+[Link to the online app](https://find-linked-pubs.streamlit.app/)
 
 ## Overview
 
