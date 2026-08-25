@@ -12,24 +12,16 @@ It is designed for two parallel datasets — **IEs** (impact evaluations) and **
 
 - **Within-dataset audit**: check all records in an existing dataset against each other
 - **Batch comparison**: check a new incoming batch against an approved base database
-- **One-off check**: compare records within any ad-hoc file, without maintaining a database
 
 ---
 
 ## Use cases
 
 **Use Case 1 — One-time audit of an existing dataset**
-You have a large Excel export of published records and want to find any pairs that may be linked. Run `file_check.py` on the file. Results are written to an Excel workbook for human review.
+You have a large set of records in a spreadsheet or RIS file and want to find any pairs that may be linked. Run `file_check.py` on the file. Results are written to an Excel workbook for human review.
 
 **Use Case 2 — Ongoing batch workflow**
-New batches of ~500 records arrive periodically. Before each batch is entered into the database, compare it against the approved base using `compare_to_base.py` to flag any potential links. After review, append the approved records to the base with `build_base.py --append`, ready for the next round.
-
-**Use Case 3 — Ad-hoc one-off check**
-You have a reference list (RIS or Excel) and want to check it for internal links, without any database involved. Run `file_check.py` on the file; output goes to `data/oneoff/oneoff_output/`.
-
-
-
-Note that the tool does essentially the same thing in **Use Case 1** and **Use Case 3**, but for purposes of organizing input/output files, it is useful to treat them separately.
+You have an existing database of records and want to add a new batch of records to it. Before the new batch is entered into the database, you can compare it against existing set using `compare_to_base.py` to flag any potential links. After review, you can append the newly approved records to the base with `build_base.py --append`, ready for the next round.
 
 ---
 
