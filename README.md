@@ -8,10 +8,7 @@ This tool scans a set of research publications and flags pairs that are likely r
 
 The tool is tailored for use in maintaining a living evidence repository in international development, but many parts of the tool can be adapted for more general use.
 
-It is designed for two parallel datasets — **IEs** (impact evaluations) and **SRs** (systematic reviews) — and supports two main workflows:
-
-- **Within-dataset audit**: check all records in an existing dataset against each other
-- **Batch comparison**: check a new incoming batch against an approved base database
+It is designed to work with two types of studies — **impact evaluations** (IEs)  and **systematic reviews** (SRs) — with customised logic to identify linkages among each type of study.
 
 ---
 
@@ -20,14 +17,14 @@ It is designed for two parallel datasets — **IEs** (impact evaluations) and **
 **Use Case 1 — One-time audit of an existing dataset**
 You have a large set of records in a spreadsheet or RIS file and want to find any pairs that may be linked. Run `file_check.py` on the file. Results are written to an Excel workbook for human review.
 
-**Use Case 2 — Ongoing batch workflow**
-You have an existing database of records and want to add a new batch of records to it. Before the new batch is entered into the database, you can compare it against existing set using `compare_to_base.py` to flag any potential links. After review, you can append the newly approved records to the base with `build_base.py --append`, ready for the next round.
+**Use Case 2 — Ongoing batch workflow for living evidence products**
+You have an existing database of records and want to periodically add new batches of records, while capturing any linked relationships between the existing database and the new batch. You can build a "base database" from your existing records with `build_base.py`. Before entering a new batch into the database, you can compare it against the existing set using `compare_to_base.py` to flag any potential links. After review, you can append the newly approved records to the base with `build_base.py --append`, ready for the next round.
 
 ---
 
 ## How it works
 
-Records are compared in three stages, trading speed for accuracy:
+Records are compared in three stages, balancing speed and accuracy:
 
 ```
 Input records
@@ -50,16 +47,19 @@ Composite score + ranked Excel output
 
 **Stage 2** scores each candidate pair on several features:
 
-- **Author overlap** — weighted by name rarity, so a shared unusual surname counts for more than a shared common one. Name frequency is looked up using the `names-dataset` library (a global name frequency database) by default; alternatively, a frequency table built from the public ORCID researcher registry (~20 million records) can be used (see `--name-freq` in the CLI reference). Before comparison, author names are normalised: accents are removed, initials are standardised, and names stored as "Surname, Firstname" are rewritten to "Firstname Surname". To handle transposed names, each pair is compared both as-is and with the name tokens sorted alphabetically — the best of the two scores is used, so "Aggarwal, Shilpa" and "Shilpa Aggarwal" will match correctly regardless of which order they appear in each record.
-- **Title similarity** — TF-IDF cosine similarity (a standard measure of word-overlap between texts, adjusted for how common each word is across all records).
-- **Year gap** — penalises large differences in publication year.
-- **Country signal (IE only)** — whether the two records mention the same country. For Excel input, country is read from a dedicated `country` column; for RIS input, which has no country field, country names are automatically extracted from the title and abstract using a built-in list of ~180 country names, aliases, and demonyms (e.g. "Kenyan" → Kenya, "DRC" → Congo). Country signal is therefore somewhat less reliable for RIS input than for Excel input.
+- *Author overlap* — weighted by name rarity, so a shared unusual surname counts for more than a shared common one. Name frequency is looked up using the `names-dataset` library (a global name frequency database) by default; alternatively, a frequency table built from the public ORCID researcher registry (~20 million records) can be used (see `--name-freq` in the CLI reference). Before comparison, author names are normalised: accents are removed, initials are standardised, and names stored as "Surname, Firstname" are rewritten to "Firstname Surname". To handle transposed names, each pair is compared both as-is and with the name tokens sorted alphabetically — the best of the two scores is used, so "Aggarwal, Shilpa" and "Shilpa Aggarwal" will match correctly regardless of which order they appear in each record.
 
-If both records share a registration ID number (e.g. ISRCTN, NCT, PROSPERO), the composite score is floored at a high value regardless of other signals; conflicting trial IDs cap it at a low value. These signals are combined into a weighted composite score.
+- *Title similarity* — TF-IDF cosine similarity (a standard measure of word-overlap between texts, adjusted for how common each word is across all records).
 
-**Stage 3** sends the most promising pairs to a large language model, which reads the titles and abstracts and gives an independent score with a rationale. The LLM result is incorporated into the final composite.
+- *Year gap* — penalises large differences in publication year.
 
-**Country signal** is used as a score modifier for IEs (country overlap is a meaningful signal of linked publications) but is disabled for SRs, where country is rarely relevant. See the Stage 2 description above for how country is determined for each input format.
+- *Country signal (IE only)* — whether the two records mention the same country. For Excel input, the tool looks for country information in a dedicated `country` column; for RIS input, which has no country field, country names are automatically extracted from the title and abstract using a built-in list of ~180 country names, aliases, and demonyms (e.g. "Kenyan" → Kenya, "DRC" → Congo). Note that country is used as a score modifier only for IEs (where country overlap is a meaningful signal of linked publications). Since most SRs have an international focus, country information is not used in generating SR similarity scores.
+
+- *Registration number* If both records share a registration ID number (e.g. ISRCTN, NCT, PROSPERO), the composite score is floored at a high value regardless of other signals; conflicting trial IDs cap it at a low value. These signals are combined into a weighted composite score.
+
+**Stage 3 (optional)** sends pairs within a user-specified range of base composite scores to a large language model, which reads the titles and abstracts and gives an independent score with a rationale. The LLM result is incorporated into the final composite.
+
+**Country signal** 
 
 **Composite score formula** (weights configurable in `.env`):
 ```
