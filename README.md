@@ -1,5 +1,7 @@
 # Linked Publications Detection Tool
 
+(Link to the online app)[https://find-linked-pubs.streamlit.app/]
+
 ## Overview
 
 This tool scans a set of research publications and flags pairs that are likely reporting on the same underlying study — known as "linked publications". It combines author name matching, title similarity, and AI-based semantic comparison to produce a ranked list of candidate pairs for human review.
