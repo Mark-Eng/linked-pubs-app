@@ -1,5 +1,7 @@
-# Web app
+# Web app & API service
 streamlit>=1.30
+fastapi>=0.110
+uvicorn>=0.28
 
 # Core ML / similarity
 faiss-cpu>=1.7.4
@@ -20,6 +22,9 @@ rispy>=0.7            # RIS file parsing
 openpyxl>=3.1         # Excel output
 pandas>=2.0
 xlrd>=2.0             # Legacy .xls support
+
+# Database (optional for direct MySQL sync)
+mysql-connector-python>=8.0
 
 # Utilities
 python-dotenv>=1.0

@@ -17,6 +17,10 @@ The composite formula is:
        + WEIGHT_YEAR   * year_score)
   composite = clip(raw + country_modifier, 0, 1)
 
+A disjoint-country penalty is scaled by COUNTRY_PENALTY_LLM_RELIEF_FACTOR when
+the LLM score is at least COUNTRY_PENALTY_LLM_RELIEF_THRESHOLD (recorded as
+PairScore.country_penalty_relaxed).
+
 When LLM scoring is skipped (e.g. pair below pre-filter threshold),
 its weight is redistributed to the other components proportionally.
 """
@@ -29,20 +33,30 @@ import numpy as np
 
 import config as cfg
 from author_matching import author_overlap_score, matched_author_pairs
-from country_extraction import country_signal, extract_countries
-from text_processing import title_similarity, title_similarity_fallback, load_tfidf_model
+from country_extraction import EXTRACTION_VERSION, country_signal, extract_countries
+from text_processing import title_similarity, title_similarity_fallback
 from trial_registration import extract_trial_ids, trial_id_signal
 from llm_scoring import ScoringResult
 
 logger = logging.getLogger(__name__)
 
+# Set by the caller before scoring: every entry point fits or loads a TF-IDF
+# model for the corpus in play (the base index's model for comparisons against
+# a base, a freshly fitted one for within-file checks) and assigns it here.
+# When it is None, title scoring degrades to the token-overlap fallback rather
+# than silently using a model fitted on the wrong corpus.
 _tfidf_model = None
+_tfidf_warned = False
 
 
 def _get_tfidf():
-    global _tfidf_model
-    if _tfidf_model is None:
-        _tfidf_model = load_tfidf_model()
+    global _tfidf_warned
+    if _tfidf_model is None and not _tfidf_warned:
+        _tfidf_warned = True
+        logger.warning(
+            "No TF-IDF model set — title similarity will use the token-overlap "
+            "fallback. Callers should assign scoring._tfidf_model first."
+        )
     return _tfidf_model
 
 
@@ -69,6 +83,74 @@ class PairScore:
     countries_b: list[str]             = field(default_factory=list)
     trial_id_signal_value: int         = 0   # +1 shared, -1 conflict, 0 absent
     trial_id_description: str          = ""
+    country_penalty_relaxed: bool      = False   # disjoint penalty eased by a high LLM score
+
+
+# ── Individual feature scorers ─────────────────────────────────────────────────
+
+def scoring_config_snapshot(name_frequency: str, **extra) -> dict:
+    """
+    Every setting that can change a PairScore, for cache invalidation.
+
+    Callers that cache computed scores must store this alongside them and
+    discard the cache when it differs. Without it, changing a weight in .env
+    and re-running the same input returns the *old* scores from cache with no
+    indication anything is stale — which matters more once weights and
+    thresholds are exposed as admin settings in a web interface.
+
+    name_frequency is passed in rather than read here so that building a
+    snapshot cannot trigger the ~1.7 GB name-frequency load as a side effect;
+    pass the value returned by author_matching.init_frequency_db(). The
+    *effective* source belongs in the key because a run that silently fell
+    back to unweighted matching produces different author scores from a
+    weighted one.
+
+    OUTPUT_THRESHOLD and the LLM pre-filter settings are deliberately absent:
+    they filter and select pairs after scoring rather than changing any score.
+    """
+    snapshot = {
+        "weight_author":            cfg.WEIGHT_AUTHOR,
+        "weight_title":             cfg.WEIGHT_TITLE,
+        "weight_llm":               cfg.WEIGHT_LLM,
+        "weight_embedding":         cfg.WEIGHT_EMBEDDING,
+        "weight_year":              cfg.WEIGHT_YEAR,
+        "country_overlap_bonus":    cfg.COUNTRY_OVERLAP_BONUS,
+        "country_disjoint_penalty": cfg.COUNTRY_DISJOINT_PENALTY,
+        "country_penalty_llm_relief_threshold": cfg.COUNTRY_PENALTY_LLM_RELIEF_THRESHOLD,
+        "country_penalty_llm_relief_factor":    cfg.COUNTRY_PENALTY_LLM_RELIEF_FACTOR,
+        "country_extraction_version": EXTRACTION_VERSION,
+        "trial_id_match_floor":    cfg.TRIAL_ID_MATCH_FLOOR,
+        "trial_id_conflict_ceil":   cfg.TRIAL_ID_CONFLICT_CEIL,
+        "year_gap_threshold":       cfg.YEAR_GAP_THRESHOLD,
+        "year_gap_penalty":         cfg.YEAR_GAP_PENALTY,
+        "author_match_threshold":   cfg.AUTHOR_MATCH_THRESHOLD,
+        "author_initial_matching":  cfg.AUTHOR_INITIAL_MATCHING,
+        "name_rarity_max_weight":   cfg.NAME_RARITY_MAX_WEIGHT,
+        "name_frequency":           name_frequency,
+        "ann_top_k":                cfg.ANN_TOP_K,
+    }
+    snapshot.update(extra)
+    return snapshot
+
+
+def describe_config_change(cached: dict | None, current: dict) -> str:
+    """
+    Human-readable summary of why a cached snapshot no longer applies.
+
+    Names the settings that actually changed, so a cache miss is explicable
+    rather than mysterious.
+    """
+    if not cached:
+        return "no scoring configuration recorded in cache"
+    differences = [
+        f"{key}: {cached.get(key, '(absent)')!r} → {current[key]!r}"
+        for key in sorted(current)
+        if cached.get(key) != current[key]
+    ]
+    removed = [key for key in sorted(cached) if key not in current]
+    if removed:
+        differences.append(f"no longer tracked: {', '.join(removed)}")
+    return "; ".join(differences) or "settings match"
 
 
 # ── Individual feature scorers ─────────────────────────────────────────────────
@@ -89,9 +171,20 @@ def _year_score(year_a, year_b) -> float:
 
 def _resolve_countries(record: dict) -> list[str]:
     """
-    Get country list for a record:
-    - Use the DB country field if populated.
-    - Otherwise extract from title + abstract.
+    Get the country list for a record: the country field if populated,
+    otherwise extracted from title + abstract.
+
+    This is a per-pair fallback, and deliberately regex-only. The LLM tier
+    (country_extraction.resolve_countries_with_fallback) belongs upstream,
+    where each record is resolved exactly once — calling it here would mean
+    an API request per *pair*, so a record appearing in 100 candidate pairs
+    would be sent 100 times.
+
+    Every CLI pre-resolves before scoring, so in those paths this returns the
+    stored value and the fallback never fires. It exists for callers that
+    score a record they have just been handed — api_service scoring a record
+    the user is still typing — and extraction is memoised so repeated pairs
+    for the same record cost one pass.
     """
     db_countries = record.get("country") or []
     if db_countries:
@@ -137,7 +230,8 @@ def score_pair(
     rec_b: dict,
     embedding_sim: float = 0.0,
     llm_result: ScoringResult | None = None,
-    use_country: bool = True,
+    *,
+    use_country: bool,
 ) -> PairScore:
     """
     Compute a full PairScore for two publication records.
@@ -147,6 +241,12 @@ def score_pair(
     rec_a, rec_b    : publication dicts (must have id, title, authors, year, country)
     embedding_sim   : cosine similarity from FAISS (already computed during retrieval)
     llm_result      : pre-computed LLM result, or None if LLM was not called
+    use_country     : whether the country modifier applies. Required and
+                      keyword-only rather than defaulting to True: the default
+                      caused two real bugs, applying the -0.40 country-mismatch
+                      penalty to SR pairs in batch_check and api_service, where
+                      country is not a meaningful signal. Pass
+                      `use_country=(dataset == "ie")`.
     """
     # ── Feature scores ─────────────────────────────────────────────────────────
     author_sc = author_overlap_score(
@@ -197,6 +297,17 @@ def score_pair(
             llm_evidence = llm_result.key_evidence
             llm_confidence = llm_result.confidence
 
+    # A near-certain LLM verdict outweighs a country mismatch, which is more
+    # often a country fill-in error than a genuinely different study country.
+    # Applied before the trial-ID override so a conflicting ID still caps.
+    country_penalty_relaxed = (
+        c_signal == -1
+        and llm_sc is not None
+        and llm_sc >= cfg.COUNTRY_PENALTY_LLM_RELIEF_THRESHOLD
+    )
+    if country_penalty_relaxed:
+        country_mod *= cfg.COUNTRY_PENALTY_LLM_RELIEF_FACTOR
+
     # ── Trial registration number signal ───────────────────────────────────────
     trial_ids_a = extract_trial_ids(rec_a.get("abstract", "") or "")
     trial_ids_b = extract_trial_ids(rec_b.get("abstract", "") or "")
@@ -236,6 +347,7 @@ def score_pair(
         countries_b=countries_b,
         trial_id_signal_value=tr_signal,
         trial_id_description=tr_desc,
+        country_penalty_relaxed=country_penalty_relaxed,
     )
 
 
@@ -243,6 +355,8 @@ def score_candidates(
     query_record: dict,
     candidates: list[tuple[dict, float]],   # (record, embedding_sim)
     run_llm: bool = True,
+    *,
+    use_country: bool,
 ) -> list[PairScore]:
     """
     Score a list of (candidate_record, embedding_sim) tuples against a query record.
@@ -250,12 +364,16 @@ def score_candidates(
     Applies the LLM pre-filter: only the top LLM_TOP_K candidates (by stage-2
     score) that exceed LLM_PREFILTER_THRESHOLD are sent to the LLM.
     Returns all PairScores sorted by composite score descending.
+
+    use_country must be False for SR datasets, matching the CLI scripts —
+    country overlap is only a meaningful signal for impact evaluations.
     """
     from llm_scoring import score_pairs
 
     # ── Stage-2: feature scores without LLM ───────────────────────────────────
     stage2 = [
-        score_pair(query_record, cand, embedding_sim=emb_sim, llm_result=None)
+        score_pair(query_record, cand, embedding_sim=emb_sim, llm_result=None,
+                   use_country=use_country)
         for cand, emb_sim in candidates
     ]
 
@@ -288,7 +406,9 @@ def score_candidates(
         cand = candidate_map[stage2_score.id_b]
         emb_sim = stage2_score.embedding_sim
         llm_res = llm_map.get(stage2_score.id_b)
-        final_scores.append(score_pair(query_record, cand, emb_sim, llm_res))
+        final_scores.append(
+            score_pair(query_record, cand, emb_sim, llm_res, use_country=use_country)
+        )
 
     final_scores.sort(key=lambda s: s.composite, reverse=True)
     return [s for s in final_scores if s.composite >= cfg.OUTPUT_THRESHOLD]

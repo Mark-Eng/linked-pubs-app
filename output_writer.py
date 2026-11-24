@@ -93,9 +93,10 @@ _PAIR_COLUMNS = [
     ("Year Score",         "year_score",             9),
     ("Country Signal",     "country_signal_value",   9),
     ("Country Info",       "country_description",   30),
+    ("Country Penalty Relaxed", "country_penalty_relaxed", 10),
     ("Trial ID Signal",    "trial_id_signal_value",  9),
     ("Trial ID Info",      "trial_id_description",  40),
-    ("ID A",               "id_a",                  8),
+    ("ID A",               "id_a",                  11),
     ("Source project A",   "source_project_a",      25),
     ("Status A",           "status_a",              18),
     ("Title A",            "title_a",               45),
@@ -138,6 +139,7 @@ def _pair_row(ps: PairScore, records: dict) -> dict[str, Any]:
         "year_score":          ps.year_score,
         "country_signal_value": ps.country_signal_value,
         "country_description": ps.country_description,
+        "country_penalty_relaxed": "Yes" if ps.country_penalty_relaxed else "",
         "trial_id_signal_value": ps.trial_id_signal_value,
         "trial_id_description": ps.trial_id_description,
         "id_a":                ps.id_a,
@@ -177,6 +179,10 @@ def write_excel(
     output_path   : path for the output .xlsx file
     run_metadata  : optional dict of key→value to include in summary sheet
     """
+    # The output directory is derived from a configurable data root, so it is
+    # not guaranteed to exist the way the checked-in data/ tree was.
+    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+
     wb = Workbook()
 
     # ── Sheet 1: Summary ───────────────────────────────────────────────────────

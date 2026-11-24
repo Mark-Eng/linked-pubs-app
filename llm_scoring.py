@@ -31,14 +31,13 @@ Each call returns a ScoringResult with:
 
 from __future__ import annotations
 import asyncio
-import json
 import logging
-import re
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import config as cfg
+from llm_io import extract_first_json_object, retry_after_seconds, strip_control_chars
 
 logger = logging.getLogger(__name__)
 
@@ -47,12 +46,7 @@ _PROMPT_PATH = Path(__file__).parent / "prompts" / "semantic_similarity.txt"
 _PROMPT_TEMPLATE = _PROMPT_PATH.read_text(encoding="utf-8")
 
 
-_CONTROL_CHARS_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
-
-
-def _sanitise(text: str) -> str:
-    """Remove control characters that break JSON serialisation."""
-    return _CONTROL_CHARS_RE.sub("", text)
+_sanitise = strip_control_chars
 
 
 def _build_prompt(rec_a: dict, rec_b: dict) -> str:
@@ -87,33 +81,67 @@ class ScoringResult:
     raw_response: str            = ""
 
 
+def _coerce_score(raw: object) -> float | None:
+    """
+    A usable score in [0, 1], or None if the model didn't give one.
+
+    Clamped rather than trusted. The score is multiplied by WEIGHT_LLM and
+    added to the composite, which is only clipped at the very end — so an
+    out-of-range value (a model answering 0-100, say) would swamp every other
+    signal and push the pair to the ceiling.
+    """
+    if isinstance(raw, bool) or not isinstance(raw, (int, float, str)):
+        return None
+    try:
+        score = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if score != score:                        # NaN
+        return None
+    if not 0.0 <= score <= 1.0:
+        logger.warning("LLM returned score %r outside [0, 1] — clamping", raw)
+        score = min(1.0, max(0.0, score))
+    return score
+
+
 def _parse_llm_response(text: str) -> ScoringResult:
-    """Parse JSON from LLM response text, with graceful fallback."""
-    try:
-        # Strip any accidental markdown fences
-        clean = re.sub(r"```(?:json)?|```", "", text).strip()
-        data = json.loads(clean)
-        return ScoringResult(
-            score=float(data.get("score", 0.0)),
-            rationale=data.get("rationale", ""),
-            key_evidence=data.get("key_evidence", []),
-            confidence=data.get("confidence", "low"),
-            raw_response=text,
-        )
-    except (json.JSONDecodeError, ValueError) as exc:
-        logger.warning("Failed to parse LLM response: %s — %s", exc, text[:200])
-        return ScoringResult(error=f"Parse error: {exc}", raw_response=text)
+    """
+    Parse the scoring JSON out of an LLM response.
+
+    Every field is validated rather than trusted. The previous version called
+    data.get(...) on whatever json.loads returned and coerced the score with a
+    bare float(), so a response that was a JSON array raised AttributeError and
+    a non-numeric score raised TypeError — neither of which it caught, so both
+    escaped asyncio.gather and failed the whole batch instead of degrading the
+    one pair.
+    """
+    data = extract_first_json_object(text)
+    if data is None:
+        logger.warning("LLM response contained no JSON object — %s", text[:200])
+        return ScoringResult(error="Parse error: no JSON object in response",
+                             raw_response=text)
+
+    score = _coerce_score(data.get("score"))
+    if score is None:
+        logger.warning("LLM response had no usable score: %r", data.get("score"))
+        return ScoringResult(error=f"Parse error: unusable score {data.get('score')!r}",
+                             raw_response=text)
+
+    evidence = data.get("key_evidence") or []
+    if not isinstance(evidence, list):
+        evidence = [str(evidence)]
+
+    confidence = data.get("confidence", "low")
+
+    return ScoringResult(
+        score=score,
+        rationale=str(data.get("rationale") or ""),
+        key_evidence=[str(item) for item in evidence],
+        confidence=str(confidence) if confidence else "low",
+        raw_response=text,
+    )
 
 
-def _get_retry_after(exc: Exception) -> float | None:
-    """Return the retry-after header value in seconds if the API provided one."""
-    try:
-        val = exc.response.headers.get("retry-after")  # type: ignore[attr-defined]
-        if val is not None:
-            return float(val)
-    except Exception:
-        pass
-    return None
 
 
 # ── Anthropic backend ──────────────────────────────────────────────────────────
@@ -139,7 +167,7 @@ async def _score_anthropic(prompt: str, semaphore: asyncio.Semaphore) -> Scoring
                 if attempt >= cfg.LLM_MAX_RETRIES:
                     logger.error("Anthropic API error after %d attempts: %s", attempt, exc)
                     return ScoringResult(error=str(exc))
-                wait = _get_retry_after(exc) or delay
+                wait = retry_after_seconds(exc) or delay
                 logger.warning("Rate limit (attempt %d/%d) — retrying in %.1fs", attempt, cfg.LLM_MAX_RETRIES, wait)
                 await asyncio.sleep(wait)
                 delay *= 2
@@ -182,7 +210,7 @@ async def _score_openai(prompt: str, semaphore: asyncio.Semaphore) -> ScoringRes
                 if attempt >= cfg.LLM_MAX_RETRIES:
                     logger.error("OpenAI API error after %d attempts: %s", attempt, exc)
                     return ScoringResult(error=str(exc))
-                wait = _get_retry_after(exc) or delay
+                wait = retry_after_seconds(exc) or delay
                 logger.warning("Rate limit (attempt %d/%d) — retrying in %.1fs", attempt, cfg.LLM_MAX_RETRIES, wait)
                 await asyncio.sleep(wait)
                 delay *= 2
@@ -227,21 +255,21 @@ async def score_pairs_async(
         else:
             return ScoringResult(error=f"Unknown LLM_PROVIDER: {provider!r}")
 
-    from tqdm import tqdm
-    tqdm_bar = tqdm(total=total, desc="Stage 3: LLM scoring")
+    from progress import progress
+    bar = progress(total=total, desc="Stage 3: LLM scoring")
 
     async def _score_and_update(rec_a: dict, rec_b: dict) -> ScoringResult:
         nonlocal completed
         result = await _score_one(rec_a, rec_b)
         completed += 1
-        tqdm_bar.update(1)
+        bar.update(1)
         if progress_callback is not None:
             progress_callback(completed, total)
         return result
 
     tasks = [_score_and_update(a, b) for a, b in pairs]
     results = await asyncio.gather(*tasks)
-    tqdm_bar.close()
+    bar.close()
     return results
 
 

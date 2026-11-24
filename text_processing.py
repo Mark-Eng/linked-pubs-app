@@ -13,14 +13,11 @@ from __future__ import annotations
 import json
 import logging
 import re
-import string
 from pathlib import Path
 
 import numpy as np
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
-
-import config as cfg
 
 logger = logging.getLogger(__name__)
 
@@ -59,10 +56,14 @@ def _tokenise(text: str) -> list[str]:
 
 # ── TF-IDF vectoriser ──────────────────────────────────────────────────────────
 
-def build_tfidf_model(titles: list[str]) -> TfidfVectorizer:
+def fit_tfidf(titles: list[str]) -> TfidfVectorizer:
     """
-    Fit a TF-IDF vectoriser on a list of title strings.
-    The model is saved to disk (cfg.TFIDF_PATH) for reuse.
+    Fit a TF-IDF vectoriser on a list of title strings. No disk I/O — pair
+    with save_tfidf() to persist it.
+
+    This is the single definition of the TF-IDF configuration. Every caller
+    must go through it: a model fitted with different parameters produces
+    title scores that are not comparable with those from the base index.
     """
     vectoriser = TfidfVectorizer(
         analyzer="word",
@@ -74,6 +75,12 @@ def build_tfidf_model(titles: list[str]) -> TfidfVectorizer:
         ngram_range=(1, 2),       # unigrams and bigrams
     )
     vectoriser.fit(titles)
+    logger.info("TF-IDF model fitted on %d titles", len(titles))
+    return vectoriser
+
+
+def save_tfidf(vectoriser: TfidfVectorizer, path: Path | str) -> None:
+    """Serialise a fitted vectoriser's vocabulary and IDF weights to JSON."""
     data = {
         "params": {
             "min_df":      vectoriser.min_df,
@@ -84,24 +91,23 @@ def build_tfidf_model(titles: list[str]) -> TfidfVectorizer:
         "vocabulary": vectoriser.vocabulary_,
         "idf":        vectoriser.idf_.tolist(),
     }
-    with open(cfg.TFIDF_PATH, "w", encoding="utf-8") as fh:
+    with open(path, "w", encoding="utf-8") as fh:
         json.dump(data, fh)
-    logger.info("TF-IDF model fitted on %d titles, saved to %s", len(titles), cfg.TFIDF_PATH)
-    return vectoriser
+    logger.info("TF-IDF model saved to %s", path)
 
 
-def load_tfidf_model() -> TfidfVectorizer | None:
+def load_tfidf(path: Path | str) -> TfidfVectorizer | None:
     """
-    Load the pre-fitted TF-IDF model from disk, or None if not found.
+    Load a fitted TF-IDF model from the given path, or None if not found.
 
     The JSON file stores the vocabulary and IDF weights; the vectoriser is
     reconstructed from these so that transform() works identically to the
     original fitted model.
     """
-    if not Path(cfg.TFIDF_PATH).exists():
-        logger.warning("TF-IDF model not found at %s — run build_index.py first", cfg.TFIDF_PATH)
+    if not Path(path).exists():
+        logger.warning("TF-IDF model not found at %s", path)
         return None
-    with open(cfg.TFIDF_PATH, encoding="utf-8") as fh:
+    with open(path, encoding="utf-8") as fh:
         data = json.load(fh)
 
     from sklearn.feature_extraction.text import TfidfTransformer

@@ -22,16 +22,34 @@ Excel file: must have columns named (case-insensitive):
   title (required), authors (semicolon-delimited), abstract, year
   A numeric ID column is auto-generated.
 
+Any record with no country — all RIS records, and Excel records with no
+country column or a blank cell — has it extracted from the title and abstract.
+Extraction uses the regex gazetteer, with an LLM fallback for records where
+the gazetteer finds nothing (IE datasets only; disable with --no-llm-country).
+
 Output
 ──────
 Excel workbook with Summary and Pairs sheets (same format as batch_check.py).
 
-Embedding cache
-───────────────
-Embeddings are saved to <input>.embedcache.json alongside the input file after
-the first run. Subsequent runs load from cache instead of calling the OpenAI
-API, saving time and cost. The cache is invalidated automatically if the input
-file is modified. Use --no-cache to force regeneration.
+Caches
+──────
+Three caches sit alongside the input file, so a re-run skips the expensive
+stages instead of paying for them again:
+
+  <input>.embedcache.json    OpenAI embeddings, keyed on the record ids and
+                             the embedding text format (EMBED_VERSION)
+  <input>.countrycache.json  countries extracted from record text, keyed on the
+                             record ids and the extraction mode
+  <input>.stage2cache.json   candidate pairs and their stage-2 scores
+
+All three are invalidated when the input file is modified or its record ids
+change. The stage-2 cache additionally records every setting that feeds into a
+composite score — the weights, the thresholds, the country mode, and the author
+name weighting actually in effect — and regenerates when any of them differs,
+naming what changed. Without that, editing a weight in .env and re-running the
+same file would silently return the previous scores.
+
+Use --no-cache to force regeneration of all three.
 """
 
 import argparse
@@ -40,10 +58,10 @@ import dataclasses
 import datetime
 import json
 import logging
-import sys
 from pathlib import Path
 
 import config as cfg
+from errors import ConfigurationError, InputError, cli_entry
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -55,9 +73,8 @@ def _parse_ris(path: str) -> list[dict]:
     """Parse a RIS file into a list of record dicts."""
     try:
         import rispy
-    except ImportError:
-        logger.error("rispy not installed — run: pip install rispy")
-        sys.exit(1)
+    except ImportError as exc:
+        raise ConfigurationError("rispy not installed — run: pip install rispy") from exc
 
     with open(path, encoding="utf-8-sig") as fh:
         entries = rispy.load(fh)
@@ -85,10 +102,21 @@ def _parse_ris(path: str) -> list[dict]:
         else:
             rec_id = entry.get("id") or f"ris_{i}"
 
+        # Some RIS exports (e.g. this EPPI-Reviewer format) put every author on a
+        # single AU line as a semicolon-joined string instead of one AU line per
+        # author. Split on ";" to recover individual names either way — a plain
+        # name with no embedded ";" just passes through unchanged.
+        authors = [
+            part.strip()
+            for a in authors_raw
+            for part in str(a).split(";")
+            if part.strip()
+        ]
+
         records.append({
             "id":             rec_id,
             "title":          title.strip(),
-            "authors":        [a.strip() for a in authors_raw if a.strip()],
+            "authors":        authors,
             "abstract":       abstract.strip(),
             "year":           year,
             "country":        [],
@@ -108,8 +136,11 @@ def _parse_excel(path: str, sheet: str | None = None) -> list[dict]:
     df.columns = df.columns.str.lower().str.strip()
 
     if "title" not in df.columns:
-        logger.error("Excel file must have a 'title' column.")
-        sys.exit(1)
+        found = ", ".join(str(c) for c in df.columns[:12]) or "(no columns)"
+        raise InputError(
+            f"{Path(path).name}: Excel file must have a 'title' column. "
+            f"Columns found: {found}"
+        )
 
     # Detect optional column aliases for flexibility with different export formats
     year_col = "year" if "year" in df.columns else (
@@ -120,14 +151,33 @@ def _parse_excel(path: str, sheet: str | None = None) -> list[dict]:
     has_source_project_col = "source_project" in df.columns
     has_status_col = "status" in df.columns
 
+    def _author_names(row) -> list[str]:
+        authors_raw = str(row.get("authors", "")).strip()
+        return [a.strip() for a in authors_raw.split(";") if a.strip() and authors_raw != "nan"]
+
+    # Some exports (e.g. the 3ie DEP) use a layout with
+    # one row per author, where only the FIRST row of each publication has the
+    # title/abstract/year/etc. populated — subsequent rows for the same
+    # publication have a blank title and just one more author in the authors
+    # column. Treat a blank-title row as a continuation of the previous record
+    # (append its author) rather than as a separate (and skippable) record.
     records = []
+    current = None
+    n_continuation_rows = 0
     for i, row in df.iterrows():
         title = str(row.get("title", "")).strip()
+
         if not title or title == "nan":
+            if current is not None:
+                current["authors"].extend(_author_names(row))
+                n_continuation_rows += 1
             continue
 
-        authors_raw = str(row.get("authors", "")).strip()
-        authors = [a.strip() for a in authors_raw.split(";") if a.strip() and authors_raw != "nan"]
+        if current is not None:
+            records.append(current)
+            current = None
+
+        authors = _author_names(row)
 
         abstract = str(row.get("abstract", "")).strip()
         if abstract == "nan":
@@ -167,7 +217,7 @@ def _parse_excel(path: str, sheet: str | None = None) -> list[dict]:
         else:
             status = None
 
-        records.append({
+        current = {
             "id":             rec_id,
             "title":          title,
             "authors":        authors,
@@ -176,21 +226,92 @@ def _parse_excel(path: str, sheet: str | None = None) -> list[dict]:
             "country":        country,
             "source_project": source_project,
             "status":         status,
-        })
+        }
 
-    logger.info("Parsed %d records from Excel file", len(records))
+    if current is not None:
+        records.append(current)
+
+    logger.info(
+        "Parsed %d records from Excel file (%d continuation rows merged in as additional authors)",
+        len(records), n_continuation_rows,
+    )
     return records
 
 
 def load_records(input_path: str, sheet: str | None = None) -> list[dict]:
+    """
+    Parse an input file into record dicts, dispatching on extension.
+
+    Raises InputError for an unsupported extension or malformed content, so
+    that callers other than the CLI — a web import adapter, for instance —
+    can report the problem instead of being terminated by it.
+    """
+    if not Path(input_path).exists():
+        raise InputError(f"Input file not found: {input_path}")
+
     ext = Path(input_path).suffix.lower()
     if ext in (".ris", ".txt"):
         return _parse_ris(input_path)
-    elif ext in (".xlsx", ".xls"):
+    if ext in (".xlsx", ".xls"):
         return _parse_excel(input_path, sheet)
+    raise InputError(
+        f"Unsupported file type '{ext}' for {Path(input_path).name} "
+        f"(use .ris, .txt, .xlsx, or .xls)"
+    )
+
+
+# ── Country extraction ─────────────────────────────────────────────────────────
+
+def _load_countries(records: list[dict], input_path: str, no_cache: bool, use_llm: bool) -> None:
+    """
+    Populate rec["country"] in place for records that have none, extracting
+    country names from the title + abstract. Records with a populated country
+    field keep it. Applies to every input format: RIS has no country field,
+    and Excel files may lack the column or leave cells blank.
+
+    Results are cached to <input>.countrycache.json so the LLM fallback isn't
+    paid for again on a re-run. The cache is invalidated if the input file is
+    newer, the record IDs differ, or the extraction mode changed.
+    """
+    from country_extraction import (
+        EXTRACTION_VERSION, extract_countries, resolve_countries_with_fallback,
+    )
+
+    cache_path = Path(input_path).with_suffix(".countrycache.json")
+    input_mtime = Path(input_path).stat().st_mtime
+    current_ids = [r["id"] for r in records]
+    mode = f"{'llm' if use_llm else 'regex'}:v{EXTRACTION_VERSION}"
+
+    if not no_cache and cache_path.exists() and cache_path.stat().st_mtime >= input_mtime:
+        with open(cache_path, encoding="utf-8") as fh:
+            cached = json.load(fh)
+        if cached.get("ids") == current_ids and cached.get("mode") == mode:
+            for rec, countries in zip(records, cached["countries"]):
+                rec["country"] = countries
+            logger.info("Loaded extracted countries from cache (%s)", cache_path.name)
+            return
+        logger.info("Country cache doesn't match input — re-extracting…")
+
+    needs_country = [rec for rec in records if not rec.get("country")]
+    texts = [(rec.get("title") or "") + " " + (rec.get("abstract") or "") for rec in needs_country]
+    if use_llm:
+        resolved = resolve_countries_with_fallback(texts)
     else:
-        logger.error("Unsupported file type: %s (use .ris, .txt, or .xlsx)", ext)
-        sys.exit(1)
+        resolved = [extract_countries(t) for t in texts]
+    for rec, countries in zip(needs_country, resolved):
+        rec["country"] = countries
+
+    n_identified = sum(1 for r in records if r.get("country"))
+    logger.info("Country identified for %d/%d records", n_identified, len(records))
+
+    cache_data = {
+        "mode":      mode,
+        "ids":       current_ids,
+        "countries": [r.get("country") or [] for r in records],
+    }
+    with open(cache_path, "w", encoding="utf-8") as fh:
+        json.dump(cache_data, fh)
+    logger.info("Extracted countries cached to %s", cache_path)
 
 
 # ── Embedding cache ────────────────────────────────────────────────────────────
@@ -201,9 +322,10 @@ def _load_embeddings(records: list[dict], input_path: str, no_cache: bool):
     Loads from cache if available and current; otherwise calls the OpenAI API
     and saves a fresh cache.
     """
-    import numpy as np
     import faiss
-    from embeddings import embed_texts, _text_for_embedding, EMBED_VERSION
+    import numpy as np
+
+    from embeddings import EMBED_VERSION, _text_for_embedding, embed_texts
 
     cache_path = Path(input_path).with_suffix(".embedcache.json")
     input_mtime = Path(input_path).stat().st_mtime
@@ -247,11 +369,16 @@ def _load_embeddings(records: list[dict], input_path: str, no_cache: bool):
 
 # ── Main ───────────────────────────────────────────────────────────────────────
 
-def main():
+def _run():
     parser = argparse.ArgumentParser(description="File-based linked-publication detection")
     parser.add_argument("--input",     required=True,  help="Input RIS or Excel file")
     parser.add_argument("--sheet",     default=None,   help="Excel sheet name (default: first sheet)")
     parser.add_argument("--no-llm",    action="store_true")
+    parser.add_argument(
+        "--no-llm-country", action="store_true",
+        help="Disable LLM fallback for country extraction (fires only when regex extraction "
+             "finds nothing, and only for IE datasets; default: enabled)",
+    )
     parser.add_argument("--no-cache",  action="store_true", help="Force re-generation of embeddings")
     parser.add_argument("--threshold", type=float, default=cfg.OUTPUT_THRESHOLD)
     parser.add_argument("--output",    type=str,   default=None)
@@ -285,14 +412,17 @@ def main():
         cfg.NAME_FREQUENCY_SOURCE = args.name_freq
 
     output_file = args.output or (
-        f"data/oneoff/oneoff_output/linked_pairs_{Path(args.input).stem}_{datetime.date.today():%Y%m%d}.xlsx"
+        cfg.oneoff_output_dir()
+        / f"Within batch - linked_pairs_{Path(args.input).stem} "
+          f"({datetime.date.today():%Y-%m-%d}).xlsx"  # noqa: DTZ011
     )
 
-    from scoring import score_pair
+    import faiss
+    from progress import progress
+
     from llm_scoring import score_pairs as llm_score_pairs
     from output_writer import write_excel
-    from tqdm import tqdm
-    import faiss
+    from scoring import score_pair
 
     records = load_records(args.input, args.sheet)
 
@@ -303,8 +433,30 @@ def main():
         logger.info("Status filter %s: %d → %d records", status_set, before, len(records))
 
     if len(records) < 2:
-        logger.error("Need at least 2 records to compare.")
-        sys.exit(1)
+        raise InputError(
+            f"Need at least 2 records to compare, found {len(records)} "
+            f"in {Path(args.input).name}."
+        )
+
+    # Both are start-up conditions that would otherwise fail late or not at all.
+    # The LLM key is checked because neither consumer fails loudly without it:
+    # the country fallback catches its own errors and returns no countries, and
+    # stage-3 scoring records a per-pair error and carries on — so a missing key
+    # yields a complete-looking run with those signals silently absent.
+    #
+    # The embeddings key is deliberately NOT checked here: a fully cached re-run
+    # makes no API call, and requiring the key would break working offline. The
+    # guard in embeddings._get_client() covers the case where one is really
+    # needed, before any spend.
+    llm_country = use_country and not args.no_llm_country
+    cfg.check_api_keys(need_llm=not args.no_llm or llm_country)
+
+    from author_matching import init_frequency_db
+    name_weighting = init_frequency_db()
+
+    # Records with no country (RIS, an Excel file without a country column, or
+    # a blank cell) get it extracted from title + abstract, whatever the format
+    _load_countries(records, args.input, args.no_cache, llm_country)
 
     records_by_id = {r["id"]: r for r in records}
 
@@ -312,6 +464,7 @@ def main():
     logger.info("Building TF-IDF model from input titles…")
     titles = [r["title"] for r in records if r.get("title")]
     from sklearn.feature_extraction.text import TfidfVectorizer
+
     from text_processing import _tokenise
     tfidf = TfidfVectorizer(
         analyzer="word", tokenizer=_tokenise, token_pattern=None,
@@ -320,8 +473,8 @@ def main():
     tfidf.fit(titles)
 
     # Monkey-patch tfidf into text_processing and scoring for this run
-    import text_processing as tp
     import scoring as sc_module
+    import text_processing as tp
     tp._tfidf_model = tfidf
     sc_module._tfidf_model = tfidf
 
@@ -338,24 +491,38 @@ def main():
     input_mtime = Path(args.input).stat().st_mtime
     stage2_loaded = False
 
+    # The cache holds computed composite scores, so it is only reusable while
+    # every setting that feeds into them is unchanged — weights, thresholds, the
+    # country mode, and the author name weighting actually in effect.
+    from scoring import describe_config_change, scoring_config_snapshot
+    country_mode = f"{args.dataset}:{'llm' if llm_country else 'regex'}"
+    scoring_config = scoring_config_snapshot(name_weighting, country_mode=country_mode)
+
     if not args.no_cache and stage2_cache_path.exists() and \
             stage2_cache_path.stat().st_mtime >= input_mtime:
         with open(stage2_cache_path, encoding="utf-8") as fh:
             _s2 = json.load(fh)
-        # ann_sim_lookup: stored as [[id_a, id_b, sim], ...] — restore as dict with tuple keys
-        ann_sim_lookup = {(row[0], row[1]): row[2] for row in _s2["ann_sim_lookup"]}
-        # stage2: stored as list of dicts — restore as PairScore dataclasses
-        from scoring import PairScore
-        stage2 = [
-            PairScore(**{
-                **d,
-                "matched_authors": [tuple(t) for t in d.get("matched_authors", [])],
-            })
-            for d in _s2["stage2"]
-        ]
-        all_pairs = list(ann_sim_lookup.keys())
-        logger.info("Loaded Stage 1+2 results from cache (%d pairs)", len(all_pairs))
-        stage2_loaded = True
+        if _s2.get("scoring_config") != scoring_config:
+            logger.info(
+                "Stage 1+2 cache was built with different scoring settings — "
+                "regenerating (%s)",
+                describe_config_change(_s2.get("scoring_config"), scoring_config),
+            )
+        else:
+            # ann_sim_lookup: stored as [[id_a, id_b, sim], ...] — restore as dict with tuple keys
+            ann_sim_lookup = {(row[0], row[1]): row[2] for row in _s2["ann_sim_lookup"]}
+            # stage2: stored as list of dicts — restore as PairScore dataclasses
+            from scoring import PairScore
+            stage2 = [
+                PairScore(**{
+                    **d,
+                    "matched_authors": [tuple(t) for t in d.get("matched_authors", [])],
+                })
+                for d in _s2["stage2"]
+            ]
+            all_pairs = list(ann_sim_lookup.keys())
+            logger.info("Loaded Stage 1+2 results from cache (%d pairs)", len(all_pairs))
+            stage2_loaded = True
 
     if not stage2_loaded:
         # ── Stage 1: ANN candidate pairs ───────────────────────────────────────
@@ -363,7 +530,7 @@ def main():
         ann_sim_lookup: dict[tuple, float] = {}
         top_k = min(cfg.ANN_TOP_K, len(records))
 
-        for i, rec in enumerate(tqdm(records, desc="Stage 1: ANN search")):
+        for i, rec in enumerate(progress(records, desc="Stage 1: ANN search")):
             vec = vecs[i : i + 1]   # reuse pre-computed, already normalised
             sims, idxs = index.search(vec, top_k)
             for sim, idx in zip(sims[0], idxs[0]):
@@ -378,7 +545,7 @@ def main():
 
         # ── Stage 2: Feature scoring ────────────────────────────────────────────
         stage2 = []
-        for pair in tqdm(all_pairs, desc="Stage 2: feature scoring"):
+        for pair in progress(all_pairs, desc="Stage 2: feature scoring"):
             id_a, id_b = pair
             rec_a = records_by_id.get(id_a)
             rec_b = records_by_id.get(id_b)
@@ -389,6 +556,7 @@ def main():
             stage2.append(ps)
 
         cache_data = {
+            "scoring_config": scoring_config,
             # JSON object keys must be strings; store pairs as [[id_a, id_b, sim], ...]
             "ann_sim_lookup": [[k[0], k[1], v] for k, v in ann_sim_lookup.items()],
             "stage2":         [dataclasses.asdict(ps) for ps in stage2],
@@ -417,7 +585,7 @@ def main():
             llm_map = {}
 
         final_scores = []
-        for ps in tqdm(stage2, desc="Stage 3: final scoring"):
+        for ps in progress(stage2, desc="Stage 3: final scoring"):
             llm_res = llm_map.get((ps.id_a, ps.id_b))
             emb_sim = ann_sim_lookup.get((max(ps.id_a, ps.id_b), min(ps.id_a, ps.id_b)), 0.0)
             final_scores.append(score_pair(records_by_id[ps.id_a], records_by_id[ps.id_b], emb_sim, llm_res, use_country=use_country))
@@ -435,10 +603,16 @@ def main():
         "Status filter": ", ".join(args.status) if args.status else "None",
         "Candidate pairs checked": len(all_pairs),
         "LLM scoring": "Yes" if not args.no_llm else "No",
+        "LLM country fallback": "Yes" if llm_country else "No",
+        "Author name weighting": name_weighting,
         "Score threshold": args.threshold,
     }
     write_excel(final_scores, records_by_id, output_file, run_metadata=metadata)
     logger.info("Done — results written to %s", output_file)
+
+
+def main():
+    cli_entry(_run, logger)
 
 
 if __name__ == "__main__":

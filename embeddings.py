@@ -1,29 +1,30 @@
 """
 embeddings.py
 ─────────────
-OpenAI text embeddings and FAISS index management.
+OpenAI text embeddings and FAISS query helpers.
 
 The FAISS index enables fast approximate nearest-neighbour (ANN) search so we
 can retrieve a small candidate set (e.g. 100 records) from 20,000 in <1 second,
 without comparing every pair.
 
-Index storage
-─────────────
-  index/publications.faiss  — the FAISS index (float32 vectors)
-  index/id_map.json         — list mapping FAISS row position → DB publication id
+This module generates vectors and queries an index it is given. Persisting an
+index to disk and reading it back is base_store.py's job (save_base /
+load_base), which keeps the FAISS index, id map, records, raw vectors, and
+TF-IDF model versioned together as one set.
 """
 
 from __future__ import annotations
-import json
 import logging
 import time
-from pathlib import Path
 
 import numpy as np
 import faiss
 from openai import OpenAI
 
 import config as cfg
+from errors import ConfigurationError
+from llm_io import retry_after_seconds
+from progress import progress
 
 logger = logging.getLogger(__name__)
 
@@ -33,8 +34,18 @@ _openai_client: OpenAI | None = None
 def _get_client() -> OpenAI:
     global _openai_client
     if _openai_client is None:
-        _openai_client = OpenAI(api_key=cfg.OPENAI_API_KEY)
+        if not cfg.OPENAI_API_KEY:
+            raise ConfigurationError(
+                "OPENAI_API_KEY is not set — it is required for embeddings. "
+                "Add it to .env or the environment."
+            )
+        # max_retries=0: disable the SDK's own retry so our backoff (below) is
+        # the only mechanism — mirrors the pattern used for LLM calls in
+        # llm_scoring.py.
+        _openai_client = OpenAI(api_key=cfg.OPENAI_API_KEY, max_retries=0)
     return _openai_client
+
+
 
 
 # ── Embedding generation ───────────────────────────────────────────────────────
@@ -72,21 +83,51 @@ def embed_texts(texts: list[str], batch_size: int = 100) -> np.ndarray:
     Processes in batches to respect API limits.
     Returns an (N, EMBEDDING_DIM) float32 array.
     """
-    from tqdm import tqdm
-
     client = _get_client()
     all_embeddings = []
     batches = range(0, len(texts), batch_size)
+    max_attempts = cfg.LLM_MAX_RETRIES     # clamped to >= 1 in config
 
-    for i in tqdm(batches, desc="Generating embeddings", unit="batch",
-                  total=len(batches)):
+    from openai import RateLimitError, InternalServerError
+
+    for i in progress(batches, desc="Generating embeddings", unit="batch",
+                      total=len(batches)):
         batch = texts[i : i + batch_size]
         # Replace None/empty with a placeholder
         batch = [t if t else "[empty]" for t in batch]
-        response = client.embeddings.create(
-            model=cfg.OPENAI_EMBEDDING_MODEL,
-            input=batch,
-        )
+
+        # Reset per batch. Leaving it bound across iterations would mean a
+        # batch that somehow fell through the retry loop silently reused the
+        # previous batch's vectors — embeddings for the wrong texts, with no
+        # error to show it.
+        response = None
+        delay = cfg.LLM_RETRY_BASE_DELAY
+        for attempt in range(1, max_attempts + 1):
+            try:
+                response = client.embeddings.create(
+                    model=cfg.OPENAI_EMBEDDING_MODEL,
+                    input=batch,
+                )
+                break
+            except RateLimitError as exc:
+                if attempt >= max_attempts:
+                    raise
+                wait = retry_after_seconds(exc) or delay
+                logger.warning("Embeddings rate limit (attempt %d/%d) — retrying in %.1fs",
+                                attempt, max_attempts, wait)
+                time.sleep(wait)
+                delay *= 2
+            except InternalServerError:
+                if attempt >= max_attempts:
+                    raise
+                logger.warning("Embeddings server error (attempt %d/%d) — retrying in %.1fs",
+                                attempt, max_attempts, delay)
+                time.sleep(delay)
+                delay *= 2
+
+        if response is None:   # defensive: the loop above either breaks or raises
+            raise RuntimeError(f"Embedding batch at offset {i} produced no response")
+
         batch_vecs = [item.embedding for item in response.data]
         all_embeddings.extend(batch_vecs)
         if i + batch_size < len(texts):
@@ -102,48 +143,9 @@ def embed_single(text: str) -> np.ndarray:
 
 # ── FAISS index management ─────────────────────────────────────────────────────
 
-def build_faiss_index(records: list[dict]) -> tuple[faiss.Index, list]:
-    """
-    Build a FAISS inner-product index from a list of publication records.
-    Vectors are L2-normalised so inner product == cosine similarity.
-
-    Returns (index, id_map) where id_map[i] is the DB id of FAISS row i.
-    Saves both to disk.
-    """
-    texts = [_text_for_embedding(r) for r in records]
-    id_map = [r["id"] for r in records]
-
-    logger.info("Generating embeddings for %d records…", len(texts))
-    vecs = embed_texts(texts)
-
-    # L2-normalise for cosine similarity via inner product
-    faiss.normalize_L2(vecs)
-
-    index = faiss.IndexFlatIP(cfg.EMBEDDING_DIM)
-    index.add(vecs)
-
-    faiss.write_index(index, str(cfg.FAISS_INDEX_PATH))
-    with open(cfg.ID_MAP_PATH, "w") as fh:
-        json.dump(id_map, fh)
-
-    logger.info(
-        "FAISS index built: %d vectors. Saved to %s",
-        index.ntotal,
-        cfg.FAISS_INDEX_PATH,
-    )
-    return index, id_map
-
-
-def load_faiss_index() -> tuple[faiss.Index, list] | tuple[None, None]:
-    """Load the FAISS index and id_map from disk. Returns (None, None) if not found."""
-    if not Path(cfg.FAISS_INDEX_PATH).exists():
-        logger.warning("FAISS index not found — run build_index.py first")
-        return None, None
-    index = faiss.read_index(str(cfg.FAISS_INDEX_PATH))
-    with open(cfg.ID_MAP_PATH) as fh:
-        id_map = json.load(fh)
-    logger.info("Loaded FAISS index with %d vectors", index.ntotal)
-    return index, id_map
+# Building and loading a persistent index lives in base_store.py
+# (save_base / load_base) — there is deliberately no second implementation
+# here. This module only generates vectors and queries an index it is handed.
 
 
 def query_index(

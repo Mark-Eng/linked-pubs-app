@@ -15,6 +15,7 @@ This is NOT about identifying duplicate records (the same document appearing twi
 
 WHAT TO LOOK FOR
 Strong evidence of linkage (raises score significantly):
+- Same trial ID reported in abstract
 - Significant overlap in list of authors
 - Both papers describe the same named programme or intervention (e.g., "BRAC's Targeting the Ultra-Poor")
 - Same specific geographic area at district or sub-national level (not just same country)
